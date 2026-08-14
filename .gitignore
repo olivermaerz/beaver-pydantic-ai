@@ -1,0 +1,30 @@
+# Environment variables
+.env
+.env.local
+
+# Mac stuff
+.DS_Store
+
+# Python stuff
+__pycache__/
+venv/
+sunnyvenv/
+
+# IDE stuff
+.vscode/
+
+# Jupyter stuff
+.jupyter_cache/
+.jupyter_checkpoints/
+.jupyter_checkpoints_history/
+.jupyter_checkpoints_history_/
+.ipynb_checkpoints/
+
+# Project specific stuff
+rubric.md
+project_overview.md
+original_readme.md
+
+# Generated database
+*.db
+*.db-journal
