@@ -1,0 +1,71 @@
+---
+config:
+  theme: neo
+  look: neo
+  fontFamily: '''Open Sans Variable'', sans-serif'
+  layout: dagre
+  themeVariables:
+    fontFamily: '''Open Sans Variable'', sans-serif'
+---
+flowchart TB
+ subgraph s0["Orchestrator Agent: routes the request"]
+        o1["Consult Inventory: ask about stock and restock"]
+        o2["Request Quote: ask for a priced offer with bulk discount"]
+        o3["Place Order: record a sale if we can ship"]
+        b(("Orchestrator Agent"))
+  end
+ subgraph s1["Inventory Agent: stock and restock"]
+        i0["List Catalog Items: sellable names from paper_supplies"]
+        i1["Get All Inventory (get_all_inventory): stock snapshot as of a date"]
+        i2["Get Stock Level (get_stock_level): stock for one item as of a date"]
+        i7["Assess Stock (get_stock_level): requested qty vs stock and reorder point"]
+        i3["Get Cash Balance (get_cash_balance): cash as of a date"]
+        i4["Get Supplier Delivery Date (get_supplier_delivery_date): delivery date from qty and start date"]
+        i5["Create Transaction (create_transaction): record a stock_orders purchase"]
+        i8["Restock Item (create_transaction, get_cash_balance): buy stock if cash allows"]
+        i6["Generate Financial Report (generate_financial_report): cash and inventory as of a date"]
+        c(("Inventory Agent"))
+  end
+ subgraph s2["Quoting Agent: prices and quote history"]
+        q1["Search Quote History (search_quote_history): past quotes matching search terms"]
+        q2["Lookup Unit Price: unit_price from paper_supplies"]
+        q3["Build Quote: itemized total with bulk discount from paper_supplies"]
+        d(("Quoting Agent"))
+  end
+ subgraph s3["Ordering Agent: sales"]
+        r1["Get Stock Level (get_stock_level): stock for one item as of a date"]
+        r4["Verify Fulfillment (get_stock_level): can we ship this qty"]
+        r2["Get Supplier Delivery Date (get_supplier_delivery_date): delivery date from qty and start date"]
+        r3["Create Transaction (create_transaction): record a sales transaction"]
+        r5["Place Sale (create_transaction): write a sale only if stock covers"]
+        e(("Ordering Agent"))
+  end
+    a{"Customer Request"} -- request_date, item names, quantities --> b
+    b --> o1 & o2 & o3
+    o1 -- date, items, qty --> c
+    o2 -- date, items, qty --> d
+    o3 -- date, items, qty, quote total --> e
+    i0 --> i1
+    i1 --> i2 & h[("SQLite DB")]
+    i2 --> i7 & h
+    i7 --> i3
+    i3 --> i4 & h
+    i4 --> i5
+    i5 --> i8 & h
+    i8 --> i6 & h
+    c --> i0
+    d --> q1
+    q1 --> q2 & h
+    q2 --> q3
+    e --> r1
+    r1 --> r4 & h
+    r4 --> r2 & h
+    r2 --> r3
+    r3 --> r5 & h
+    c -- current_stock, can fulfill, shortfall, restock cost, purchase delivery --> f(("Orchestrator Agent"))
+    d -- line items, bulk discount, quote total, rationale --> f
+    e -- fulfilled yes or no, sale id, customer delivery date --> f
+    i6 --> h
+    r5 --> h
+    f -- items, qty, quote total, fulfill yes or no, delivery, why --> g{"Customer Reply"}
+    i7 --> h

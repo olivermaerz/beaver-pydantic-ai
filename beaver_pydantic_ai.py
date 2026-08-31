@@ -12,7 +12,7 @@ from sqlalchemy import create_engine, Engine
 # loading the openai stuff
 from openai import OpenAI
 # loading the pydantic ai stuff
-from pydantic_ai import Agent
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -624,21 +624,236 @@ base_url = os.getenv("OPENAI_BASE_URL")
 if not base_url:
     raise ValueError("Doh! OpenAI base URL is not set, eh?")
 
+# OpenAIChatModel is from pydantic_ai.models.openai
 model = OpenAIChatModel(
     "gpt-4o-mini",
-    provider=OpenAIProvider(
+    provider=OpenAIProvider( # OpenAIProvider is from pydantic_ai.providers.openai
         api_key=api_key,
         base_url="https://openai.vocareum.com/v1",
     ),
 )
 
 
-
 """Set up tools for your agents to use, these should be methods that combine the database functions above
  and apply criteria to them to ensure that the flow of the system is correct."""
 
+# helpers from the starter code we need to wrap:
+# inventory: get_all_inventory, get_stock_level, get_cash_balance,
+#     get_supplier_delivery_date, generate_financial_report
+# create_transaction -> stock_orders here, sales on the ordering agent
+# quoting: search_quote_history
 
-# Tools for inventory agent
+
+# ------------------------------------------------------------------------------------------------------
+# Inventory Agent
+# ------------------------------------------------------------------------------------------------------
+
+# The agent definition (used below via @inventory_agent decorator)
+inventory_agent = Agent(
+    model,
+    name="inventory_agent",
+    deps_type=str, # deps is the request date in YYYY-MM-DD format
+    instructions=(
+        "You manage inventory for Beaver's Choice Paper Company. "
+        "Use only the exact item names from the catalog. "  # from README
+        "Check stock, reorder when needed, and use the database. "  # from Project Overview
+        "Always look at stock and cash before buying more. "
+        "Do not spend more cash than we have. "
+        "Report current stock, shortages, restock cost, and delivery date. "
+        "Do not create sales. "
+    ),
+)
+
+
+# Helper function for catalog item
+def catalog_item(item_name: str) -> dict | None:
+    """
+    Find a paper_supplies item by exact name (not case sensitive).
+    """
+    item_name = item_name.strip().lower() # strip whitespace and convert to lowercase
+    for item in paper_supplies:
+        if item["item_name"].strip().lower() == item_name: # we lowercased item_name so we need to lowercase item["item_name"] as well
+            return item # ... but returning the original item not lowercased item_name
+    return None
+
+# The tools:
+
+@inventory_agent.tool_plain() # plain means no context is passed to the tool
+def list_catalog_items() -> List[str]: # returns a list of strings
+    """ 
+    List every catalog items name that the company sells.
+    """
+    catalog_items = []
+    for item in paper_supplies:
+        catalog_items.append(item["item_name"])
+    return catalog_items
+
+
+@inventory_agent.tool
+def list_inventory(ctx: RunContext[str]) -> dict[str, int]:
+    """
+    All items with positive stock.
+    """
+    # get_all_inventory already returns {item_name: quantity}
+    return get_all_inventory(ctx.deps)
+
+
+@inventory_agent.tool
+def check_stock(ctx: RunContext[str], item_name: str) -> dict:
+    """
+    Current stock for one item.
+    """
+    item = catalog_item(item_name)
+    if item is None:
+        return {"message": f"unknown item: {item_name}"}
+
+    stock_df = get_stock_level(item["item_name"], ctx.deps) # ctx.deps = date in YYYY-MM-DD
+    if stock_df.empty:
+        current_stock = 0
+    else:
+        current_stock = int(stock_df["current_stock"].iloc[0] or 0)
+    return {"item_name": item["item_name"], "current_stock": current_stock}
+
+
+@inventory_agent.tool
+def assess_stock(ctx: RunContext[str], item_name: str, requested_quantity: int) -> dict:
+    """
+    Assess quantity of requested item vs stock and when to restock.
+    """
+    stock_result = check_stock(ctx, item_name) # using the check_stock tool to get the current stock
+    if "message" in stock_result:
+        return stock_result
+
+    exact_name = stock_result["item_name"]
+    stock = stock_result["current_stock"]
+    inventory_df = pd.read_sql("SELECT * FROM inventory", db_engine)
+    match = inventory_df[inventory_df["item_name"] == exact_name]
+    # if the item is found in the inventory database, get the min stock level
+    if not match.empty:
+        min_stock = int(match.iloc[0]["min_stock_level"])
+        below_reorder_point = stock < min_stock
+        can_fulfill = requested_quantity <= stock
+    else:
+        min_stock = None
+        below_reorder_point = False
+        can_fulfill = False
+    shortfall = max(requested_quantity - stock, 0)
+    return {
+        "item_name": exact_name,
+        "requested_quantity": requested_quantity,
+        "current_stock": stock,
+        "min_stock_level": min_stock,
+        "can_fulfill": can_fulfill,
+        "shortfall": shortfall,
+        "below_reorder_point": below_reorder_point,
+    }
+
+
+@inventory_agent.tool
+def check_cash_balance(ctx: RunContext[str]) -> dict:
+    """
+    Cash on hand. Check this before restocking so we don't spend more than we have.
+    """
+    cash = float(get_cash_balance(ctx.deps))
+    return {"as_of_date": ctx.deps, "cash_balance": cash}
+
+
+@inventory_agent.tool
+def estimate_supplier_delivery_date(ctx: RunContext[str], quantity: int) -> dict:
+    """
+    Estimate the supplier delivery date for restocking an item with a certain quantity
+    for a specific order date.
+    """
+    delivery_date = get_supplier_delivery_date(ctx.deps, quantity) # does not need item_name as input because it is not used in the function
+    return {
+        "quantity": quantity,
+        "order_date": ctx.deps,
+        "delivery_date": delivery_date,
+    }
+
+
+@inventory_agent.tool
+def create_stock_order(ctx: RunContext[str], item_name: str, quantity: int) -> dict:
+    """
+    Record a stock purchase for specified item and quantity at a requested date.
+    transaction_type: stock_orders (does not create a sale)
+    """
+    item = catalog_item(item_name)
+    if item is None:
+        return {"message": f"unknown item: {item_name}"}
+    if quantity <= 0:
+        return {"message": "quantity must be positive"}
+
+    unit_price = float(item["unit_price"])
+    total_price = quantity * unit_price
+    transaction_id = create_transaction(
+        item["item_name"],
+        "stock_orders",
+        quantity,
+        total_price,
+        ctx.deps,
+    )
+    return {
+        "item_name": item["item_name"],
+        "quantity": quantity,
+        "total_price": total_price,
+        "transaction_id": transaction_id,
+    }
+
+
+@inventory_agent.tool
+def restock_item(ctx: RunContext[str], item_name: str, requested_quantity: int = 0) -> dict:
+    """
+    Restock item if quantity is requested and it is below the reorder point.
+    Checks cash first. If cash availble is more than cost -> write a stock_orders transaction
+    """
+    if requested_quantity < 0:
+        return {"message": "quantity must be positive"}
+
+    assessment = assess_stock(ctx, item_name, requested_quantity)
+    if "message" in assessment:
+        return assessment
+
+    item_name = assessment["item_name"]
+    stock = assessment["current_stock"]
+    shortfall = assessment["shortfall"] # requested_quantity - stock
+    min_stock = assessment["min_stock_level"]
+
+    # buy the shortfall, or enough to get back over min stock, whichever is bigger
+    restock_quantity = shortfall
+    if assessment["below_reorder_point"] and min_stock is not None:
+        restock_quantity = max(restock_quantity, min_stock - stock)
+
+    if restock_quantity <= 0:
+        return {"message": "no restock needed", "item_name": item_name, "current_stock": stock}
+
+    item = catalog_item(item_name) # only to get unit_price
+    restock_cost = restock_quantity * float(item["unit_price"])
+    cash = float(get_cash_balance(ctx.deps))
+
+    if cash < restock_cost:
+        return {"message": "not enough cash", "restock_cost": restock_cost, "cash_balance": cash}
+
+    order = create_stock_order(ctx, item_name, restock_quantity)
+    if "message" in order:
+        return order
+
+    delivery = estimate_supplier_delivery_date(ctx, restock_quantity)
+    return {
+        "item_name": item_name,
+        "quantity": restock_quantity,
+        "restock_cost": restock_cost,
+        "transaction_id": order["transaction_id"],
+        "delivery_date": delivery["delivery_date"],
+    }
+
+
+@inventory_agent.tool
+def get_financial_report(ctx: RunContext[str]) -> dict:
+    """
+    Cash, inventory value, and assets.
+    """
+    return generate_financial_report(ctx.deps)
 
 
 # Tools for quoting agent
