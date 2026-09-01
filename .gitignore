@@ -1,4 +1,4 @@
-# Environment variables
+# Environment stuff
 .env
 .env.local
 
@@ -24,6 +24,7 @@ sunnyvenv/
 rubric.md
 project_overview.md
 original_readme.md
+*.zip
 
 # Generated database
 *.db

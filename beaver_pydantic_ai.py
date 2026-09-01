@@ -655,12 +655,16 @@ inventory_agent = Agent(
     deps_type=str, # deps is the request date in YYYY-MM-DD format
     instructions=(
         "You manage inventory for Beaver's Choice Paper Company. "
-        "Use only the exact item names from the catalog. "  # from README
+        "Use the item names from the catalog. "  # from README
+        "Customers add extra words (like white, assorted, high-quality). Still use the catalog item of that type. "
+        "If we don't sell that kind of item at all, say so. "
+        "If they want more than we have, restock it. Don't ask first. "
         "Check stock, reorder when needed, and use the database. "  # from Project Overview
         "Always look at stock and cash before buying more. "
         "Do not spend more cash than we have. "
         "Report current stock, shortages, restock cost, and delivery date. "
         "Do not create sales. "
+        "Never ever ask how to proceed. Just do it. "
     ),
 )
 
@@ -668,12 +672,52 @@ inventory_agent = Agent(
 # Helper function for catalog item
 def catalog_item(item_name: str) -> dict | None:
     """
-    Find a paper_supplies item by exact name (not case sensitive).
+    Find a paper_supplies item by name (not case sensitive).
+    Customers don't type the catalog exactly, so we also match a catalog name sitting inside what they wrote (substring matching). 
     """
-    item_name = item_name.strip().lower() # strip whitespace and convert to lowercase
+    query = item_name.strip().lower() # strip whitespace and convert to lowercase
+    if not query:
+        return None
+
     for item in paper_supplies:
-        if item["item_name"].strip().lower() == item_name: # we lowercased item_name so we need to lowercase item["item_name"] as well
+        if item["item_name"].strip().lower() == query: # we lowercased query so we need to lowercase item["item_name"] as well
             return item # ... but returning the original item not lowercased item_name
+
+    # e.g. "heavy cardstock (white)" -> Cardstock, "A4 glossy paper" -> Glossy paper
+    best = None
+    best_len = 0
+    best_end = -1
+    for item in paper_supplies:
+        name = item["item_name"].strip().lower()
+        pos = query.find(name)
+        if pos == -1:
+            continue
+        end = pos + len(name)
+        # the name later in the phrase is usually the product (kraft paper envelopes -> Envelopes)
+        if end > best_end or (end == best_end and len(name) > best_len):
+            best = item
+            best_len = len(name)
+            best_end = end
+    if best is not None:
+        return best
+
+    # a few names people use that aren't written like the catalog
+    nicknames = [
+        ("washi tape", "Decorative adhesive tape (washi tape)"),
+        ("streamers", "Party streamers"),
+        ("poster board", "Large poster paper (24x36 inches)"),
+        ("poster boards", "Large poster paper (24x36 inches)"),
+        ("posters", "Poster paper"),
+        ("printer paper", "A4 paper"),
+        ("printing paper", "A4 paper"),
+        ("copy paper", "Standard copy paper"),
+        ("napkins", "Paper napkins"),
+    ]
+    for nickname, real_name in nicknames:
+        if nickname in query:
+            for item in paper_supplies:
+                if item["item_name"] == real_name:
+                    return item
     return None
 
 # The tools:
@@ -721,7 +765,7 @@ def assess_stock(ctx: RunContext[str], item_name: str, requested_quantity: int) 
     Assess quantity of requested item vs stock and when to restock.
     """
     stock_result = check_stock(ctx, item_name) # using the check_stock tool to get the current stock
-    if "message" in stock_result:
+    if stock_result.get("message"):
         return stock_result
 
     exact_name = stock_result["item_name"]
@@ -775,8 +819,7 @@ def estimate_supplier_delivery_date(ctx: RunContext[str], quantity: int) -> dict
 @inventory_agent.tool
 def create_stock_order(ctx: RunContext[str], item_name: str, quantity: int) -> dict:
     """
-    Record a stock purchase for specified item and quantity at a requested date.
-    transaction_type: stock_orders (does not create a sale)
+    Record a stock purchase. Price is qty times catalog unit_price.
     """
     item = catalog_item(item_name)
     if item is None:
@@ -804,14 +847,14 @@ def create_stock_order(ctx: RunContext[str], item_name: str, quantity: int) -> d
 @inventory_agent.tool
 def restock_item(ctx: RunContext[str], item_name: str, requested_quantity: int = 0) -> dict:
     """
-    Restock item if quantity is requested and it is below the reorder point.
+    Buy stock when they want more than we have, or we're below the reorder point.
     Checks cash first. If cash availble is more than cost -> write a stock_orders transaction
     """
     if requested_quantity < 0:
         return {"message": "quantity must be positive"}
 
     assessment = assess_stock(ctx, item_name, requested_quantity)
-    if "message" in assessment:
+    if assessment.get("message"):
         return assessment
 
     item_name = assessment["item_name"]
@@ -835,7 +878,7 @@ def restock_item(ctx: RunContext[str], item_name: str, requested_quantity: int =
         return {"message": "not enough cash", "restock_cost": restock_cost, "cash_balance": cash}
 
     order = create_stock_order(ctx, item_name, restock_quantity)
-    if "message" in order:
+    if order.get("message"):
         return order
 
     delivery = estimate_supplier_delivery_date(ctx, restock_quantity)
@@ -856,13 +899,278 @@ def get_financial_report(ctx: RunContext[str]) -> dict:
     return generate_financial_report(ctx.deps)
 
 
-# Tools for quoting agent
+# ------------------------------------------------------------------------------------------------------
+# Quoting Agent
+# ------------------------------------------------------------------------------------------------------
+
+quoting_agent = Agent(
+    model,
+    name="quoting_agent",
+    deps_type=str, # same request date as the other agents, even if we don't write to the db
+    instructions=(
+        "You make quotes. "
+        "Use the item names from catalog. "
+        "If they added extra words, still quote the catalog item of that type. "
+        "If we don't sell that kind of thing, skip it. Don't swap in a random other product. "
+        "Take a look at old quotes if they help. "
+        "This is one order. Call build_quote once with every item we can sell. "
+        "Don't quote items one at a time, the bulk discount is on the combined units. "
+        "Always put a bulk discount on quote and say why. "
+        "Use build_quote for the total. Don't invent a price. " # othewise discounts are not applied
+        "When you give the quote, say the discount percent and why. "
+    ),
+)
 
 
-# Tools for ordering agent
+@quoting_agent.tool_plain()
+def lookup_quote_history(search_terms: List[str]) -> list:
+    """
+    Past quotes matching these keywords.
+    Keep the list short, the search ANDs the terms together.
+    """
+    if not search_terms:
+        return {"message": "need some search terms"}
+    return search_quote_history(search_terms)
 
 
-# Set up your agents and create an orchestration agent that will manage them.
+@quoting_agent.tool_plain()
+def lookup_unit_price(item_name: str) -> dict:
+    """
+    Catalog unit price for one item.
+    """
+    item = catalog_item(item_name)
+    if item is None:
+        return {"message": f"unknown item: {item_name}"}
+    return {"item_name": item["item_name"], "unit_price": float(item["unit_price"])}
+
+
+@quoting_agent.tool_plain()
+def build_quote(item_names: List[str], quantities: List[int]) -> dict:
+    """
+    Itemized quote with a bulk discount on the whole order.
+    Pass every item and qty together. Don't call this once per item.
+    """
+    if len(item_names) != len(quantities):
+        return {"message": "item names and quantities don't match"}
+    if len(item_names) == 0:
+        return {"message": "need at least one item"}
+    
+    # no errors -> build the quote
+    line_items = []
+    subtotal = 0.0
+    total_units = 0
+    for i in range(len(item_names)):
+        item = catalog_item(item_names[i])
+        if item is None:
+            return {"message": f"unknown item: {item_names[i]}"}
+        qty = quantities[i]
+        if qty <= 0:
+            return {"message": "quantity must be positive"}
+        unit_price = float(item["unit_price"])
+        line_total = qty * unit_price
+        line_items.append({
+            "item_name": item["item_name"],
+            "quantity": qty,
+            "unit_price": unit_price,
+            "line_total": line_total,
+        })
+        subtotal += line_total
+        total_units += qty
+
+    # README says every quote should include a bulk discount and WHY (!)
+    if total_units >= 1000:
+        discount_rate = 0.15
+        why = "15% bulk discount because the order is 1000 or more units" 
+    elif total_units >= 500:
+        discount_rate = 0.10
+        why = "10% bulk discount because the order is 500 or more units"
+    elif total_units >= 100:
+        discount_rate = 0.05
+        why = "5% bulk discount because the order is 100 or more units"
+    else:
+        discount_rate = 0.02
+        why = "2% bulk discount on this order"
+
+    discount_amount = subtotal * discount_rate
+    total = subtotal - discount_amount
+    return {
+        "line_items": line_items,
+        "subtotal": round(subtotal, 2),
+        "discount_percent": int(discount_rate * 100),
+        "discount_amount": round(discount_amount, 2),
+        "total": round(total, 2),
+        "why": why,
+    }
+
+
+# ------------------------------------------------------------------------------------------------------
+# Ordering Agent
+# ------------------------------------------------------------------------------------------------------
+
+ordering_agent = Agent(
+    model,
+    name="ordering_agent",
+    deps_type=str, # deps is the request date in YYYY-MM-DD format
+    instructions=(
+        "You close the sale if we actually have the paper. "
+        "Don't buy stock and don't make up a new price. "
+        "Say if it shipped and when it should arrive. "
+    ),
+)
+
+
+@ordering_agent.tool
+def get_stock(ctx: RunContext[str], item_name: str) -> dict:
+    """
+    Current stock for one item. Check this before selling.
+    """
+    return check_stock(ctx, item_name)
+
+
+@ordering_agent.tool
+def verify_fulfillment(ctx: RunContext[str], item_name: str, quantity: int) -> dict:
+    """
+    Can we ship this qty from stock.
+    """
+    stock_result = check_stock(ctx, item_name)
+    if stock_result.get("message"):
+        return stock_result
+    stock = stock_result["current_stock"]
+    return {
+        "item_name": stock_result["item_name"],
+        "quantity": quantity,
+        "current_stock": stock,
+        "can_ship": quantity <= stock,
+    }
+
+
+@ordering_agent.tool
+def estimate_delivery_date(ctx: RunContext[str], quantity: int) -> dict:
+    """
+    Delivery date for this order size.
+    """
+    # same helper as restock, just how long the qty takes
+    return estimate_supplier_delivery_date(ctx, quantity)
+
+
+@ordering_agent.tool
+def create_sale(ctx: RunContext[str], item_name: str, quantity: int, price: float) -> dict:
+    """
+    Record a sale. Price comes from the quote for this line.
+    """
+    item = catalog_item(item_name)
+    if item is None:
+        return {"message": f"unknown item: {item_name}"}
+    if quantity <= 0:
+        return {"message": "quantity must be positive"}
+    if price < 0:
+        return {"message": "price can't be negative"}
+
+    transaction_id = create_transaction(
+        item["item_name"],
+        "sales",
+        quantity,
+        price,
+        ctx.deps,
+    )
+
+    return {
+        "item_name": item["item_name"],
+        "quantity": quantity,
+        "price": price,
+        "transaction_id": transaction_id,
+    }
+
+
+@ordering_agent.tool
+def place_sale(ctx: RunContext[str], item_name: str, quantity: int, price: float) -> dict:
+    """
+    Sell only if stock covers the qty.
+    """
+    check = verify_fulfillment(ctx, item_name, quantity)
+    if check.get("message"):
+        return check
+    if not check["can_ship"]:
+        return {
+            "message": "not enough stock",
+            "item_name": check["item_name"],
+            "current_stock": check["current_stock"],
+        }
+
+    sale = create_sale(ctx, item_name, quantity, price)
+    if sale.get("message"):
+        return sale
+
+    delivery = estimate_delivery_date(ctx, quantity)
+    return {
+        "item_name": sale["item_name"],
+        "quantity": quantity,
+        "price": price,
+        "transaction_id": sale["transaction_id"],
+        "delivery_date": delivery["delivery_date"],
+    
+    }
+
+
+# ------------------------------------------------------------------------------------------------------
+# Orchestrator Agent
+# ------------------------------------------------------------------------------------------------------
+
+orchestrator = Agent(
+    model,
+    name="orchestrator",
+    deps_type=str, # request date YYYY-MM-DD, passed through to the other agents
+    instructions=(
+        "You're the one talking to the customer. "
+        "Don't touch the database. Send work to inventory, quoting, and ordering. "
+        "Stock and restock first, then a quote, then sell what we can ship. "
+        "If we're short, restock in this turn, then sell. Don't ask them to confirm. "
+        "If only some items can ship, sell those and say why the rest didn't. "
+        "This is one request, one quote. Call request_quote once with every item we can sell. "
+        "Don't quote or discount each line as its own order. "
+        "Don't ask them to pick another item. "
+        "Customers won't use exact catalog names. Use the catalog item of that type "
+        "(cardstock, colored paper, glossy paper, poster paper, A4 paper, washi tape, streamers) "
+        "and say which catalog name you used. "
+        "Skip a line only if we don't sell that kind of thing (balloons, tickets, cardboard). "
+        "Still quote and sell the items we do have. "
+        "Tell them the price, the bulk discount, if we can ship, and when it arrives. "
+        "Use the quote incl. discounts from quoting, don't make up a price. " # otherwise it sometimes calculates the price itself without the bulk discount
+        "If we can't do it, say why, don't print out internal errors. "
+        "It is important that you mention the bulk discount percentage and why for the order as a whole. "
+
+    ),
+)
+
+
+async def ask_agent(agent, question: str, date: str) -> str:
+    result = await agent.run(question, deps=date)
+    return result.output
+
+
+@orchestrator.tool
+async def consult_inventory(ctx: RunContext[str], question: str) -> str:
+    """
+    Ask inventory about stock and restocking.
+    """
+    return await ask_agent(inventory_agent, question, ctx.deps)
+
+
+@orchestrator.tool
+async def request_quote(ctx: RunContext[str], question: str) -> str:
+    """
+    Ask quoting for one priced offer covering every item we can sell.
+    Send all items in this one question so the bulk discount is on the whole order.
+    """
+    return await ask_agent(quoting_agent, question, ctx.deps)
+
+
+@orchestrator.tool
+async def place_order(ctx: RunContext[str], question: str) -> str:
+    """
+    Ask ordering to record a sale if we can ship.
+    """
+    return await ask_agent(ordering_agent, question, ctx.deps)
 
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
@@ -870,7 +1178,7 @@ def get_financial_report(ctx: RunContext[str]) -> dict:
 def run_test_scenarios():
     
     print("Initializing Database...")
-    init_database()
+    init_database(db_engine, seed=42) # the answer is 42
     try:
         quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
         quote_requests_sample["request_date"] = pd.to_datetime(
@@ -888,13 +1196,7 @@ def run_test_scenarios():
     current_cash = report["cash_balance"]
     current_inventory = report["inventory_value"]
 
-    ############
-    ############
-    ############
-    # INITIALIZE YOUR MULTI AGENT SYSTEM HERE
-    ############
-    ############
-    ############
+    # orchestrator + workers are defined above
 
     results = []
     for idx, row in quote_requests_sample.iterrows():
@@ -909,16 +1211,12 @@ def run_test_scenarios():
         # Process request
         request_with_date = f"{row['request']} (Date of request: {request_date})"
 
-        ############
-        ############
-        ############
-        # USE YOUR MULTI AGENT SYSTEM TO HANDLE THE REQUEST
-        ############
-        ############
-        ############
-
-        # response = call_your_multi_agent_system(request_with_date)
-        response = "Response from the multi-agent system, eh?"
+        try:
+            result = orchestrator.run_sync(request_with_date, deps=request_date)
+            response = result.output
+        except Exception as e:
+            print(f"Doh, request failed: {e}")
+            response = "Couldn't do that one, eh?"
 
         # Update state
         report = generate_financial_report(request_date)

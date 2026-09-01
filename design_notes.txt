@@ -1,0 +1,76 @@
+The Design Notes Report
+
+Basics:
+====================================================
+
+The workflow is implemented in Python using the Pydantic AI framework. While it would have probably been
+easier/quicker to use the smolagents framework, Pydantic AI seemed to me a bit more professional and
+better suited for a reference project in GitHub. While it is no LangChain or LangGraph, it is a bit more
+advanced than the smolagents framework.
+
+
+The Agent Workflow:
+====================================================
+
+The backbone of the agent workflow is implemented with 4 agents. See workflow_diagram.png.
+
+- The Orchestrator Agent: This is the agent receiving the customer request, and it calls the other agents. So
+the customer only talks to one agent. It never writes to the db.
+- The Inventory Agent: This is the agent that manages the inventory. It gets the cash balance
+and writes transactions to the db. It reorders items that have a shortfall and gets the delivery date from
+get_supplier_delivery_date (simulated delivery date from the starter code).
+- The Quoting Agent: This is the agent that quotes the customer. It looks at the quote history, looks up unit prices,
+and builds quotes.
+- The Ordering Agent: It verifies if the number in stock is greater than the number required to fulfill the order.
+It handles cash for sales. It writes transactions to the db and places sales (if stock covers).
+
+I split the agents into ordering and inventory agents so reordering and sales are not in the same agent. Then
+quoting is a separate agent to make sure that discounts and history are not mixed into inventory or sales.
+Finally we need the fourth agent (orchestrator) so there is only one agent talking to the customer.
+
+The existing utility functions from the starter code did of course not provide all the functionality
+needed for this project. So I wrote additional utilities that then called the original functions but added
+additional functionality. The new tools call functions such as get_stock_level, create_transaction, etc.
+
+
+Issues I ran into and future improvements:
+====================================================
+
+- In earlier versions the agents always asked the customer to confirm that they want to go ahead
+with an order if they could only partially fulfill it. It took some time to get the instructions right so this
+would improve. It still happens now and then, so this should be further improved in the future.
+- Also, before improving the instructions, the agents reordered and sold those restocked items as if they were
+already in stock today. It still happens sometimes, so this would be something to improve in a future version.
+- Initially I also had the problem that the Orchestrator Agent did not always call the Quoting Agent but
+calculated the total itself (with no discount).
+- Another major issue in the improved version was that the discount was applied but not mentioned, or that it
+was applied to individual items, resulting in different discounts for different items in the same order.
+Adding additional instructions fixed those issues.
+
+Still to improve:
+------------------
+- The agents now and then still ask the customer to confirm partial orders (see first bullet above). This
+needs to be eliminated completely.
+- The agents sometimes still sell restocked items as if they were already in stock today (see second bullet above).
+This also needs to be fixed.
+
+
+The Test Results
+====================================================
+
+The test results are captured in the test_results.csv file. You can see in the file that the full 20 sample
+requests were processed. Cash moved on more than the 3 required transactions. Several orders were fully
+fulfilled, some only partially. Not all customer requests were shipped.
+
+Strengths:
+------------------
+A partial fulfillment example is transaction 2 with the balloons that are not in the catalog:
+It explained to the customer, "We do not sell balloons, so those cannot be included in your order," giving
+the customer the 'why' it was not fulfilled.
+
+An example for a large order with a discount is request 3:
+It correctly applied the 15% discount on the WHOLE order and also mentions why the discount is given:
+"**Bulk Discount**: 15% (applies because the order is for more than 1,000 units)".
+Request 3 also shows nicely how the reordered items are listed with their delivery dates:
+"- A4 paper is expected to arrive by **April 11, 2025**.
+- Printer paper is expected to arrive by **April 8, 2025**."
