@@ -6,5 +6,3 @@ Add your API keys to a `.env` file: `OPENAI_API_KEY=your_key`, `OPENAI_BASE_URL=
 
 Then run the multi-agent system with `python beaver_pydantic_ai.py` (evaluates sample quote requests and writes `test_results.csv`).
 
-If you sign up for Udacity, this is a [referral link](https://udacity.referralrock.com/l/OLIVERWOLF62/). Help out a poor AI student :)
-
